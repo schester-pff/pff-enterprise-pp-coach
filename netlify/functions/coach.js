@@ -7,8 +7,8 @@ let cachedCoreData = null;
 let cacheTimestamp = 0;
 
 // ── Fetch a single tab from the sheet ──
-async function fetchTab(tabName, apiKey) {
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(tabName)}!A:D?key=${apiKey}`;
+async function fetchTab(tabName, apiKey, range = 'A:D') {
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(tabName)}!${range}?key=${apiKey}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to fetch tab: ${tabName}`);
   const data = await res.json();
@@ -183,19 +183,28 @@ exports.handler = async function(event, context) {
     // ── EMAIL LOOKUP ──
     if (action === 'lookup') {
       const email = (body.email || '').toLowerCase().trim();
-      const rows = await fetchTab('Login', apiKey);
+      const rows = await fetchTab('Login', apiKey, 'A:E');
 
+      // Standardised Login columns (matches the Hub login sheets):
+      //   A = Email | B = First Name | C = Last Name | D = Active | E = WeekAccess ("Week 0".."Week 4")
       for (let i = 1; i < rows.length; i++) {
-        const rowEmail = (rows[i][2] || '').toLowerCase().trim();
+        const rowEmail = (rows[i][0] || '').toLowerCase().trim();   // A = Email
         if (rowEmail === email) {
+          const active = (rows[i][3] || '').toString().trim().toLowerCase() === 'active'; // D = Active
+          if (!active) {
+            return { statusCode: 200, headers, body: JSON.stringify({ status: 'inactive' }) };
+          }
+          const weekMatch = String(rows[i][4] == null ? '' : rows[i][4]).match(/(\d+)/); // E = WeekAccess
+          const weekNum = weekMatch ? parseInt(weekMatch[1], 10) : 0;
+          const weekAccess = (weekNum >= 0 && weekNum <= 4) ? weekNum : 0;
           return {
             statusCode: 200,
             headers,
             body: JSON.stringify({
               status: 'found',
-              firstName: rows[i][0] || '',
-              lastName: rows[i][1] || '',
-              weekAccess: parseInt(rows[i][3]) || 1
+              firstName: rows[i][1] || '',   // B = First Name
+              lastName: rows[i][2] || '',    // C = Last Name
+              weekAccess: weekAccess
             })
           };
         }
