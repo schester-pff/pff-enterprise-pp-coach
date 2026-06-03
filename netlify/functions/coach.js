@@ -1,13 +1,19 @@
 const SHEET_ID = '1kl84ossr5SQmDANbjnAWLb0T8q-9CEVmMJY1QJ-Xov8';
-const UNANSWERED_FORM_URL = 'https://forms.gle/j1qvYifoUWCndaVK7';
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const CAP_PER_WEEK = 20;
+const MIN_MESSAGE_CHARS = 30; // quality gate — enforced client-side but double-checked here
 
-// ── Module-level cache — persists across warm invocations ──
-let cachedCoreData = null;
+// ── Module-level caches — persist across warm invocations ──
+let cachedSheetData = null;
+let cachedSystemPrompt = null;
 let cacheTimestamp = 0;
 
+// ── Weekly usage counter — keyed by email, resets on Monday ──
+// Note: resets on cold start (function spin-down). Acceptable for this use case.
+const weeklyUsage = {};
+
 // ── Fetch a single tab from the sheet ──
-async function fetchTab(tabName, apiKey, range = 'A:D') {
+async function fetchTab(tabName, apiKey, range = 'A:B') {
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(tabName)}!${range}?key=${apiKey}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to fetch tab: ${tabName}`);
@@ -15,98 +21,85 @@ async function fetchTab(tabName, apiKey, range = 'A:D') {
   return data.values || [];
 }
 
-// ── Fetch and cache the 9 core tabs (not game tabs) ──
-async function getCoreData(apiKey) {
+// ── Get Monday of the current week (midnight UTC) ──
+function getCurrentWeekMonday() {
+  const now = new Date();
+  const day = now.getUTCDay(); // 0 = Sunday
+  const diff = day === 0 ? 6 : day - 1;
+  const monday = new Date(now);
+  monday.setUTCDate(now.getUTCDate() - diff);
+  monday.setUTCHours(0, 0, 0, 0);
+  return monday.toISOString().split('T')[0]; // "YYYY-MM-DD"
+}
+
+// ── Check weekly cap and increment counter ──
+// Returns { allowed: true/false, remaining: n }
+function checkAndIncrementCap(email) {
+  const weekKey = getCurrentWeekMonday();
+  const key = email.toLowerCase().trim();
+
+  if (!weeklyUsage[key] || weeklyUsage[key].week !== weekKey) {
+    weeklyUsage[key] = { week: weekKey, count: 0 };
+  }
+
+  if (weeklyUsage[key].count >= CAP_PER_WEEK) {
+    return { allowed: false, remaining: 0 };
+  }
+
+  weeklyUsage[key].count++;
+  return { allowed: true, remaining: CAP_PER_WEEK - weeklyUsage[key].count };
+}
+
+// ── Fetch and cache the four content tabs ──
+async function getSheetData(apiKey) {
   const now = Date.now();
-  if (cachedCoreData && (now - cacheTimestamp) < CACHE_TTL_MS) {
+  if (cachedSheetData && (now - cacheTimestamp) < CACHE_TTL_MS) {
     console.log('Cache hit — skipping sheet fetch');
-    return cachedCoreData;
+    return cachedSheetData;
   }
 
   console.log('Cache miss — fetching sheet');
-  const [rules, faq, pffu, progInfo, discord, redFlags, care, personality, resources] = await Promise.all([
+  const [rules, faq, pffu, other] = await Promise.all([
     fetchTab('PP Rules', apiKey),
     fetchTab('FAQ', apiKey),
     fetchTab('PFFU', apiKey),
-    fetchTab('Program Info', apiKey),
-    fetchTab('Discord', apiKey),
-    fetchTab('Red Flags', apiKey),
-    fetchTab('Care', apiKey),
-    fetchTab('Personality', apiKey),
-    fetchTab('Resources', apiKey),
+    fetchTab('Other', apiKey),
   ]);
 
-  cachedCoreData = { rules, faq, pffu, progInfo, discord, redFlags, care, personality, resources };
+  cachedSheetData = { rules, faq, pffu, other };
+  cachedSystemPrompt = null; // invalidate formatted prompt when data refreshes
   cacheTimestamp = now;
-  return cachedCoreData;
+  return cachedSheetData;
 }
 
-// ── Build system prompt ──
-async function buildSystemPrompt(apiKey, weekAccess) {
-  // Core tabs from cache (or fresh fetch if expired)
-  const { rules, faq, pffu, progInfo, discord, redFlags, care, personality, resources } = await getCoreData(apiKey);
-
-  // Game tabs — always fetched fresh, depend on individual trainee access level
-  const gameTabs = [];
-  const gameNames = ['Game 1', 'Game 2', 'Game 3', 'Game 4'];
-  const gamesAccessible = Math.min(weekAccess - 1, 4);
-
-  for (let i = 0; i < gamesAccessible; i++) {
-    const rows = await fetchTab(gameNames[i], apiKey);
-    gameTabs.push({ name: gameNames[i], rows });
-  }
-
-  // Format helpers
-  const fmt2col = (rows, col1 = 0, col2 = 1) =>
-    rows.slice(1).filter(r => r[col1] && r[col2])
-      .map(r => `${r[col1]}: ${r[col2]}`).join('\n\n');
-
-  const fmt3col = (rows) =>
-    rows.slice(1).filter(r => r[0] && r[2])
-      .map(r => `[${r[0]}] Q: ${r[1]}\nA: ${r[2]}`).join('\n\n');
-
-  const fmtResources = (rows) =>
-    rows.slice(1).filter(r => r[0] && r[1])
-      .map(r => `${r[0]}: ${r[1]}${r[2] ? ' — ' + r[2] : ''}`).join('\n');
-
-  const personalityText = personality.slice(1)
+// ── Format helpers ──
+const fmt2col = (rows) =>
+  rows.slice(1)
     .filter(r => r[0] && r[1])
-    .map(r => r[2] ? `${r[0]}: ${r[1]} (Resource: ${r[2]})` : `${r[0]}: ${r[1]}`)
+    .map(r => `${r[0]}: ${r[1]}`)
     .join('\n\n');
 
-  const rulesText = rules.slice(1).filter(r => r[0] && r[1])
-    .map(r => `SECTION: ${r[0]}\n${r[1]}`).join('\n\n');
+const fmtRules = (rows) =>
+  rows.slice(1)
+    .filter(r => r[0] && r[1])
+    .map(r => `SECTION: ${r[0]}\n${r[1]}`)
+    .join('\n\n');
 
-  const faqText = faq.slice(1).filter(r => r[0] && r[1])
-    .map(r => `Q: ${r[0]}\nA: ${r[1]}`).join('\n\n');
-
-  const pffuText = fmt2col(pffu);
-  const progText = fmt2col(progInfo);
-  const discordText = fmt2col(discord);
-  const redFlagsText = fmt2col(redFlags);
-  const careText = fmt2col(care);
-  const resourcesText = fmtResources(resources);
-
-  // Game-specific content
-  let gameContent = '';
-  if (gameTabs.length > 0) {
-    gameContent = `\nGAME-SPECIFIC Q&A — available based on games completed:\n`;
-    gameContent += `IMPORTANT: Only answer game-specific questions about games the trainee has completed. `;
-    gameContent += `This trainee has access to: ${gameTabs.map(g => g.name).join(', ')}.\n`;
-    gameContent += `Do NOT reveal answers about Game ${gamesAccessible + 1} or later games even if asked — those games have not been completed yet.\n\n`;
-    for (const game of gameTabs) {
-      gameContent += `=== ${game.name} ===\n`;
-      gameContent += fmt3col(game.rows);
-      gameContent += '\n\n';
-    }
-  } else {
-    gameContent = `\nGAME-SPECIFIC Q&A: This trainee has not yet completed any training games, so no game-specific play guides are available yet. When they ask about specific plays, let them know this content will unlock after they complete each game.\n`;
+// ── Build and cache the formatted system prompt ──
+async function getSystemPrompt(apiKey) {
+  // Return cached prompt string if still valid
+  if (cachedSystemPrompt && cachedSheetData && (Date.now() - cacheTimestamp) < CACHE_TTL_MS) {
+    return cachedSystemPrompt;
   }
 
-  return `You are Coach, the official PP Training Assistant for PFF Enterprise's Player Participation training program, 2026. You are knowledgeable, direct, honest, and have a dry sense of humor. You take the work seriously but not yourself.
+  const { rules, faq, pffu, other } = await getSheetData(apiKey);
 
-YOUR IDENTITY AND PERSONALITY:
-${personalityText}
+  const rulesText = fmtRules(rules);
+  const faqText   = fmt2col(faq);
+  const pffuText  = fmt2col(pffu);
+  const otherText = fmt2col(other);
+
+  cachedSystemPrompt = `You are Coach, the official PP Training Assistant for PFF Enterprise's Player Participation training program, 2026. You are knowledgeable, direct, honest, and have a dry sense of humor. You take the work seriously but not yourself.
 
 YOUR JOB:
 Answer questions about PP rules and concepts, help trainees understand their feedback data, explain how the program works, and point them to the right resources. You are available any time a trainee needs help.
@@ -115,7 +108,7 @@ TONE AND STYLE:
 - Direct, honest, and respectful. Treat trainees as equals.
 - No corporate waffle. No excessive praise or sycophancy.
 - American English spelling (program not programme, analyze not analyse).
-- Be concise — trainees are often on their phones.
+- Be concise — trainees are often on their phones. Keep answers under 150 words unless the question genuinely requires more.
 - Dry wit is appropriate. Do not be harsh.
 - When trainees are anxious about their error counts, reassure them with facts not platitudes.
 
@@ -128,9 +121,7 @@ ERROR HIERARCHY — apply this whenever discussing performance or feedback:
 IMPORTANT: You cannot be perfect at PP from broadcast footage. Nobody is. If a trainee is fixating on their total position error count when their Player Errors and Role Errors are under control, reframe this clearly and honestly.
 
 WHEN YOU CANNOT ANSWER:
-If a question falls outside your knowledge base, say so honestly and direct the trainee to submit it via this form: ${UNANSWERED_FORM_URL}
-Tell them: the team will review it, email them an answer, and add it to the knowledge base so future trainees benefit too.
-Never make up rules. Never guess. If something is genuinely ambiguous, say so and direct them to a trainer or the form.
+If a question falls outside your knowledge base, say so honestly. Direct the trainee to submit it via the unanswered question form in the Other section below. Tell them: the team will review it, email them an answer, and add it to the knowledge base so future trainees benefit too. Never make up rules. Never guess. If something is genuinely ambiguous, say so and direct them to a trainer or the form.
 
 PP RULES AND CONCEPTS:
 ${rulesText}
@@ -141,23 +132,13 @@ ${faqText}
 PFFU — E-LEARNING QUESTIONS:
 ${pffuText}
 
-PROGRAMME INFORMATION:
-${progText}
-
-DISCORD AND NAVIGATION:
-${discordText}
-
-AVAILABLE RESOURCES:
-${resourcesText}
-${gameContent}
-CARE GUIDANCE — how to handle trainees who are struggling emotionally:
-${careText}
-
-RED FLAGS — things you must not engage with:
-${redFlagsText}
+ADDITIONAL GUIDANCE — red flags, care, personality, contacts, and escalation:
+${otherText}
 
 FORMATTING:
-Keep responses focused and readable. Short paragraphs. Only use lists when they genuinely help. American English throughout.`;
+Keep responses focused and readable. Short paragraphs. Only use lists when they genuinely help. American English throughout. Under 150 words unless the question genuinely requires more.`;
+
+  return cachedSystemPrompt;
 }
 
 exports.handler = async function(event, context) {
@@ -185,16 +166,14 @@ exports.handler = async function(event, context) {
       const email = (body.email || '').toLowerCase().trim();
       const rows = await fetchTab('Login', apiKey, 'A:E');
 
-      // Standardised Login columns (matches the Hub login sheets):
-      //   A = Email | B = First Name | C = Last Name | D = Active | E = WeekAccess ("Week 0".."Week 4")
       for (let i = 1; i < rows.length; i++) {
-        const rowEmail = (rows[i][0] || '').toLowerCase().trim();   // A = Email
+        const rowEmail = (rows[i][0] || '').toLowerCase().trim();
         if (rowEmail === email) {
-          const active = (rows[i][3] || '').toString().trim().toLowerCase() === 'active'; // D = Active
+          const active = (rows[i][3] || '').toString().trim().toLowerCase() === 'active';
           if (!active) {
             return { statusCode: 200, headers, body: JSON.stringify({ status: 'inactive' }) };
           }
-          const weekMatch = String(rows[i][4] == null ? '' : rows[i][4]).match(/(\d+)/); // E = WeekAccess
+          const weekMatch = String(rows[i][4] == null ? '' : rows[i][4]).match(/(\d+)/);
           const weekNum = weekMatch ? parseInt(weekMatch[1], 10) : 0;
           const weekAccess = (weekNum >= 0 && weekNum <= 4) ? weekNum : 0;
           return {
@@ -202,9 +181,9 @@ exports.handler = async function(event, context) {
             headers,
             body: JSON.stringify({
               status: 'found',
-              firstName: rows[i][1] || '',   // B = First Name
-              lastName: rows[i][2] || '',    // C = Last Name
-              weekAccess: weekAccess
+              firstName: rows[i][1] || '',
+              lastName: rows[i][2] || '',
+              weekAccess
             })
           };
         }
@@ -219,10 +198,38 @@ exports.handler = async function(event, context) {
 
     // ── CHAT ──
     if (action === 'chat') {
-      const { messages, weekAccess } = body;
-      const accessLevel = parseInt(weekAccess) || 1;
+      const { messages, email } = body;
+      const traineeEmail = (email || '').toLowerCase().trim();
 
-      const system = await buildSystemPrompt(apiKey, accessLevel);
+      // Quality gate — server-side double-check
+      const lastMessage = messages[messages.length - 1];
+      if (lastMessage && lastMessage.content && lastMessage.content.trim().length < MIN_MESSAGE_CHARS) {
+        return {
+          statusCode: 200,
+          headers,
+          body: JSON.stringify({
+            reply: "Could you give me a bit more context? A complete question helps me give you a useful answer."
+          })
+        };
+      }
+
+      // Weekly cap check
+      if (traineeEmail) {
+        const capResult = checkAndIncrementCap(traineeEmail);
+        if (!capResult.allowed) {
+          return {
+            statusCode: 200,
+            headers,
+            body: JSON.stringify({
+              reply: `You've reached your ${CAP_PER_WEEK} question limit for this week. Your allowance resets on Monday. In the meantime, post your question in the #pp-training channel on Discord — the trainers are there to help.`,
+              capExceeded: true
+            })
+          };
+        }
+      }
+
+      // Build (or retrieve cached) system prompt
+      const system = await getSystemPrompt(apiKey);
 
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -232,10 +239,10 @@ exports.handler = async function(event, context) {
           'anthropic-version': '2023-06-01'
         },
         body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1000,
-          system: system,
-          messages: messages
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 400,
+          system,
+          messages
         })
       });
 
