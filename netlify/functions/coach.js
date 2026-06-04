@@ -123,7 +123,7 @@ async function getSheetData(weekNum, apiKey) {
 // ── Build current-week section of the prompt ──
 function buildWeekSection(weekNum, tabMap) {
   if (weekNum === 0) {
-    return `PFFU — WEEK 1 CONTENT (the trainee is currently completing the PFFU e-learning course):\n${fmt2col(tabMap['PFFU'] || [])}`;
+    return `PFFU — WEEK 0 CONTENT (the trainee is currently completing the PFFU e-learning course):\n${fmt2col(tabMap['PFFU'] || [])}`;
   }
   if (weekNum >= 1 && weekNum <= 3) {
     const gameTab = `Game ${weekNum}`;
@@ -296,13 +296,12 @@ exports.handler = async function(event, context) {
         headers: {
           'Content-Type': 'application/json',
           'x-api-key': process.env.ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01',
-          'anthropic-beta': 'prompt-caching-2024-07-31;extended-cache-ttl-2025-02-19'
+          'anthropic-version': '2023-06-01'
         },
         body: JSON.stringify({
           model: 'claude-haiku-4-5-20251001',
           max_tokens: 400,
-          system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral', ttl: 3600 } }],
+          system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
           messages
         })
       });
@@ -310,7 +309,8 @@ exports.handler = async function(event, context) {
       const data = await response.json();
 
       if (!response.ok) {
-        return { statusCode: response.status, headers, body: JSON.stringify({ error: data }) };
+        console.error('Anthropic API error:', response.status, JSON.stringify(data));
+        return { statusCode: 200, headers, body: JSON.stringify({ reply: "Sorry, something went wrong reaching the AI. Please try again in a moment." }) };
       }
 
       let replyText = data.content[0].text;
