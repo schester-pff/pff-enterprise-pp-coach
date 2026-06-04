@@ -1,15 +1,13 @@
 const SHEET_ID = '1kl84ossr5SQmDANbjnAWLb0T8q-9CEVmMJY1QJ-Xov8';
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const CAP_PER_WEEK = 16;
-const MIN_MESSAGE_CHARS = 30; // quality gate — enforced client-side but double-checked here
+const MIN_MESSAGE_CHARS = 30;
 
-// ── Module-level caches — persist across warm invocations ──
-let cachedSheetData = null;
-let cachedSystemPrompt = null;
-let cacheTimestamp = 0;
+// ── Per-week cache — each entry: { data, prompt, timestamp }
+// Keyed by weekNum (0–4) so each week's content is cached independently.
+const weekCache = {};
 
 // ── Weekly usage counter — keyed by email, resets on Monday ──
-// Note: resets on cold start (function spin-down). Acceptable for this use case.
 const weeklyUsage = {};
 
 // ── Fetch a single tab from the sheet ──
@@ -21,19 +19,29 @@ async function fetchTab(tabName, apiKey, range = 'A:B') {
   return data.values || [];
 }
 
+// ── Which tabs to load per week ──
+// Week 0 = PFFU week. Weeks 1–3 = Games 1–3. Week 4 = final test (no game hints).
+function getTabsForWeek(weekNum) {
+  const base = ['PP Rules', 'FAQ', 'Program Info', 'Discord', 'Other'];
+  if (weekNum === 0) return [...base, 'PFFU'];
+  if (weekNum === 1) return [...base, 'Game 1'];
+  if (weekNum === 2) return [...base, 'Game 2'];
+  if (weekNum === 3) return [...base, 'Game 3'];
+  return base; // Week 4: final test — no game-specific content
+}
+
 // ── Get Monday of the current week (midnight UTC) ──
 function getCurrentWeekMonday() {
   const now = new Date();
-  const day = now.getUTCDay(); // 0 = Sunday
+  const day = now.getUTCDay();
   const diff = day === 0 ? 6 : day - 1;
   const monday = new Date(now);
   monday.setUTCDate(now.getUTCDate() - diff);
   monday.setUTCHours(0, 0, 0, 0);
-  return monday.toISOString().split('T')[0]; // "YYYY-MM-DD"
+  return monday.toISOString().split('T')[0];
 }
 
-// ── Check weekly cap and increment counter ──
-// Returns { allowed, remaining, count, showHalfwayNudge }
+// ── Weekly cap ──
 function checkAndIncrementCap(email) {
   const weekKey = getCurrentWeekMonday();
   const key = email.toLowerCase().trim();
@@ -49,7 +57,6 @@ function checkAndIncrementCap(email) {
   weeklyUsage[key].count++;
   const count = weeklyUsage[key].count;
 
-  // Fire the halfway nudge once, the first time they reach the midpoint.
   let showHalfwayNudge = false;
   if (!weeklyUsage[key].nudged && count >= Math.ceil(CAP_PER_WEEK / 2)) {
     weeklyUsage[key].nudged = true;
@@ -59,57 +66,92 @@ function checkAndIncrementCap(email) {
   return { allowed: true, remaining: CAP_PER_WEEK - count, count, showHalfwayNudge };
 }
 
-// ── Halfway nudge text — appended to Coach's reply, once per week ──
 const HALFWAY_NUDGE = "\n\n---\n\n_You've used around half of your Coach questions for this week. Worth thinking about what you really need to ask — a lot of answers are already in the Hub, the PP Guide, or Discord, and for anything you're genuinely stuck on, a trainer will often help more than I can._";
 
-// ── Fetch and cache the four content tabs ──
-async function getSheetData(apiKey) {
-  const now = Date.now();
-  if (cachedSheetData && (now - cacheTimestamp) < CACHE_TTL_MS) {
-    console.log('Cache hit — skipping sheet fetch');
-    return cachedSheetData;
-  }
-
-  console.log('Cache miss — fetching sheet');
-  const [rules, faq, other] = await Promise.all([
-    fetchTab('PP Rules', apiKey),
-    fetchTab('FAQ', apiKey),
-    fetchTab('Other', apiKey),
-  ]);
-
-  cachedSheetData = { rules, faq, other };
-  cachedSystemPrompt = null; // invalidate formatted prompt when data refreshes
-  cacheTimestamp = now;
-  return cachedSheetData;
-}
-
 // ── Format helpers ──
+// 2-column tabs (Section/Content or Question/Answer)
 const fmt2col = (rows) =>
   rows.slice(1)
     .filter(r => r[0] && r[1])
     .map(r => `${r[0]}: ${r[1]}`)
     .join('\n\n');
 
+// PP Rules tab — labelled sections
 const fmtRules = (rows) =>
   rows.slice(1)
     .filter(r => r[0] && r[1])
     .map(r => `SECTION: ${r[0]}\n${r[1]}`)
     .join('\n\n');
 
-// ── Build and cache the formatted system prompt ──
-async function getSystemPrompt(apiKey) {
-  // Return cached prompt string if still valid
-  if (cachedSystemPrompt && cachedSheetData && (Date.now() - cacheTimestamp) < CACHE_TTL_MS) {
-    return cachedSystemPrompt;
+// 3-column game Q&A tabs (Play / Question / Answer)
+const fmtGame = (rows) =>
+  rows.slice(1)
+    .filter(r => r[1] && r[2])
+    .map(r => `Q: ${r[1]}\nA: ${r[2]}`)
+    .join('\n\n');
+
+// ── Fetch and cache sheet data for a given week ──
+async function getSheetData(weekNum, apiKey) {
+  const now = Date.now();
+  const cached = weekCache[weekNum];
+  if (cached && (now - cached.timestamp) < CACHE_TTL_MS) {
+    console.log(`Cache hit — week ${weekNum}`);
+    return cached.data;
   }
 
-  const { rules, faq, other } = await getSheetData(apiKey);
+  console.log(`Cache miss — fetching week ${weekNum}`);
+  const tabs = getTabsForWeek(weekNum);
 
-  const rulesText = fmtRules(rules);
-  const faqText   = fmt2col(faq);
-  const otherText = fmt2col(other);
+  // Fetch all tabs in parallel; game tabs use A:C (3 columns), others use A:B
+  const gameTabs = new Set(['Game 1', 'Game 2', 'Game 3']);
+  const fetches = tabs.map(tab =>
+    fetchTab(tab, apiKey, gameTabs.has(tab) ? 'A:C' : 'A:B').then(data => ({ tab, data }))
+  );
+  const results = await Promise.all(fetches);
 
-  cachedSystemPrompt = `You are Coach, the official PP Training Assistant for PFF Enterprise's Player Participation training program, 2026. You are knowledgeable, direct, honest, and have a dry sense of humor. You take the work seriously but not yourself.
+  const tabMap = {};
+  for (const { tab, data } of results) tabMap[tab] = data;
+
+  if (!weekCache[weekNum]) weekCache[weekNum] = {};
+  weekCache[weekNum].data = tabMap;
+  weekCache[weekNum].prompt = null; // invalidate cached prompt
+  weekCache[weekNum].timestamp = now;
+
+  return tabMap;
+}
+
+// ── Build current-week section of the prompt ──
+function buildWeekSection(weekNum, tabMap) {
+  if (weekNum === 0) {
+    return `PFFU — WEEK 1 CONTENT (the trainee is currently completing the PFFU e-learning course):\n${fmt2col(tabMap['PFFU'] || [])}`;
+  }
+  if (weekNum >= 1 && weekNum <= 3) {
+    const gameTab = `Game ${weekNum}`;
+    return `GAME ${weekNum} — PLAY-SPECIFIC Q&A (the trainee is currently working on Game ${weekNum}):\n${fmtGame(tabMap[gameTab] || [])}`;
+  }
+  if (weekNum === 4) {
+    return `NOTE: The trainee is on Game 4 — the final test game. Do not provide hints, answers, or guidance about specific plays in their game. Help them with general PP rules and concepts only. Refer them to their trainers or the PP Guide for anything beyond general rules.`;
+  }
+  return '';
+}
+
+// ── Build and cache the system prompt for a given week ──
+async function getSystemPrompt(weekNum, apiKey) {
+  const cached = weekCache[weekNum];
+  if (cached && cached.prompt && (Date.now() - cached.timestamp) < CACHE_TTL_MS) {
+    return cached.prompt;
+  }
+
+  const tabMap = await getSheetData(weekNum, apiKey);
+
+  const rulesText   = fmtRules(tabMap['PP Rules'] || []);
+  const faqText     = fmt2col(tabMap['FAQ'] || []);
+  const progText    = fmt2col(tabMap['Program Info'] || []);
+  const discordText = fmt2col(tabMap['Discord'] || []);
+  const otherText   = fmt2col(tabMap['Other'] || []);
+  const weekSection = buildWeekSection(weekNum, tabMap);
+
+  const prompt = `You are Coach, the official PP Training Assistant for PFF Enterprise's Player Participation training program, 2026. You are knowledgeable, direct, honest, and have a dry sense of humor. You take the work seriously but not yourself.
 
 YOUR JOB:
 Answer questions about PP rules and concepts, help trainees understand their feedback data, explain how the program works, and point them to the right resources. You are available any time a trainee needs help.
@@ -131,7 +173,7 @@ ERROR HIERARCHY — apply this whenever discussing performance or feedback:
 IMPORTANT: You cannot be perfect at PP from broadcast footage. Nobody is. If a trainee is fixating on their total position error count when their Player Errors and Role Errors are under control, reframe this clearly and honestly.
 
 WHEN YOU CANNOT ANSWER:
-If a question falls outside your knowledge base, say so honestly. Direct the trainee to submit it via the unanswered question form in the Other section below. Tell them: the team will review it, email them an answer, and add it to the knowledge base so future trainees benefit too. Never make up rules. Never guess. If something is genuinely ambiguous, say so and direct them to a trainer or the form.
+If a question falls outside your knowledge base, say so honestly. Direct the trainee to submit it via the unanswered question form. Tell them: the team will review it, email them an answer, and add it to the knowledge base so future trainees benefit too. Never make up rules. Never guess. If something is genuinely ambiguous, say so and direct them to a trainer or the form.
 
 PP RULES AND CONCEPTS:
 ${rulesText}
@@ -139,13 +181,24 @@ ${rulesText}
 FREQUENTLY ASKED QUESTIONS:
 ${faqText}
 
+${weekSection}
+
+PROGRAM INFO AND LOGISTICS:
+${progText}
+
+DISCORD AND NAVIGATION:
+${discordText}
+
 ADDITIONAL GUIDANCE — red flags, care, personality, contacts, and escalation:
 ${otherText}
 
 FORMATTING:
 Keep responses focused and readable. Short paragraphs. Only use lists when they genuinely help. American English throughout. Under 150 words unless the question genuinely requires more.`;
 
-  return cachedSystemPrompt;
+  if (!weekCache[weekNum]) weekCache[weekNum] = {};
+  weekCache[weekNum].prompt = prompt;
+
+  return prompt;
 }
 
 exports.handler = async function(event, context) {
@@ -196,27 +249,26 @@ exports.handler = async function(event, context) {
         }
       }
 
-      return {
-        statusCode: 200,
-        headers,
-        body: JSON.stringify({ status: 'not_found' })
-      };
+      return { statusCode: 200, headers, body: JSON.stringify({ status: 'not_found' }) };
     }
 
     // ── CHAT ──
     if (action === 'chat') {
-      const { messages, email } = body;
+      const { messages, email, weekAccess } = body;
       const traineeEmail = (email || '').toLowerCase().trim();
 
-      // Quality gate — server-side double-check
+      // Resolve weekNum — default to 0 if not provided or out of range
+      const weekNum = (typeof weekAccess === 'number' && weekAccess >= 0 && weekAccess <= 4)
+        ? weekAccess
+        : 0;
+
+      // Quality gate
       const lastMessage = messages[messages.length - 1];
       if (lastMessage && lastMessage.content && lastMessage.content.trim().length < MIN_MESSAGE_CHARS) {
         return {
           statusCode: 200,
           headers,
-          body: JSON.stringify({
-            reply: "Could you give me a bit more context? A complete question helps me give you a useful answer."
-          })
+          body: JSON.stringify({ reply: "Could you give me a bit more context? A complete question helps me give you a useful answer." })
         };
       }
 
@@ -236,20 +288,21 @@ exports.handler = async function(event, context) {
         }
       }
 
-      // Build (or retrieve cached) system prompt
-      const system = await getSystemPrompt(apiKey);
+      // Build (or retrieve cached) system prompt for this trainee's week
+      const system = await getSystemPrompt(weekNum, apiKey);
 
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'x-api-key': process.env.ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01'
+          'anthropic-version': '2023-06-01',
+          'anthropic-beta': 'prompt-caching-2024-07-31;extended-cache-ttl-2025-02-19'
         },
         body: JSON.stringify({
           model: 'claude-haiku-4-5-20251001',
           max_tokens: 400,
-          system,
+          system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral', ttl: 3600 } }],
           messages
         })
       });
@@ -257,11 +310,7 @@ exports.handler = async function(event, context) {
       const data = await response.json();
 
       if (!response.ok) {
-        return {
-          statusCode: response.status,
-          headers,
-          body: JSON.stringify({ error: data })
-        };
+        return { statusCode: response.status, headers, body: JSON.stringify({ error: data }) };
       }
 
       let replyText = data.content[0].text;
@@ -269,25 +318,13 @@ exports.handler = async function(event, context) {
         replyText += HALFWAY_NUDGE;
       }
 
-      return {
-        statusCode: 200,
-        headers,
-        body: JSON.stringify({ reply: replyText })
-      };
+      return { statusCode: 200, headers, body: JSON.stringify({ reply: replyText }) };
     }
 
-    return {
-      statusCode: 400,
-      headers,
-      body: JSON.stringify({ error: 'Unknown action' })
-    };
+    return { statusCode: 400, headers, body: JSON.stringify({ error: 'Unknown action' }) };
 
   } catch (err) {
     console.error('Function error:', err.message);
-    return {
-      statusCode: 500,
-      headers,
-      body: JSON.stringify({ error: err.message })
-    };
+    return { statusCode: 500, headers, body: JSON.stringify({ error: err.message }) };
   }
 };
