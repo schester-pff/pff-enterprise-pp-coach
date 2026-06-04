@@ -1,6 +1,6 @@
 const SHEET_ID = '1kl84ossr5SQmDANbjnAWLb0T8q-9CEVmMJY1QJ-Xov8';
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
-const CAP_PER_WEEK = 20;
+const CAP_PER_WEEK = 16;
 const MIN_MESSAGE_CHARS = 30; // quality gate — enforced client-side but double-checked here
 
 // ── Module-level caches — persist across warm invocations ──
@@ -33,22 +33,34 @@ function getCurrentWeekMonday() {
 }
 
 // ── Check weekly cap and increment counter ──
-// Returns { allowed: true/false, remaining: n }
+// Returns { allowed, remaining, count, showHalfwayNudge }
 function checkAndIncrementCap(email) {
   const weekKey = getCurrentWeekMonday();
   const key = email.toLowerCase().trim();
 
   if (!weeklyUsage[key] || weeklyUsage[key].week !== weekKey) {
-    weeklyUsage[key] = { week: weekKey, count: 0 };
+    weeklyUsage[key] = { week: weekKey, count: 0, nudged: false };
   }
 
   if (weeklyUsage[key].count >= CAP_PER_WEEK) {
-    return { allowed: false, remaining: 0 };
+    return { allowed: false, remaining: 0, count: weeklyUsage[key].count, showHalfwayNudge: false };
   }
 
   weeklyUsage[key].count++;
-  return { allowed: true, remaining: CAP_PER_WEEK - weeklyUsage[key].count };
+  const count = weeklyUsage[key].count;
+
+  // Fire the halfway nudge once, the first time they reach the midpoint.
+  let showHalfwayNudge = false;
+  if (!weeklyUsage[key].nudged && count >= Math.ceil(CAP_PER_WEEK / 2)) {
+    weeklyUsage[key].nudged = true;
+    showHalfwayNudge = true;
+  }
+
+  return { allowed: true, remaining: CAP_PER_WEEK - count, count, showHalfwayNudge };
 }
+
+// ── Halfway nudge text — appended to Coach's reply, once per week ──
+const HALFWAY_NUDGE = "\n\n---\n\n_You've used around half of your Coach questions for this week. Worth thinking about what you really need to ask — a lot of answers are already in the Hub, the PP Guide, or Discord, and for anything you're genuinely stuck on, a trainer will often help more than I can._";
 
 // ── Fetch and cache the four content tabs ──
 async function getSheetData(apiKey) {
@@ -59,14 +71,13 @@ async function getSheetData(apiKey) {
   }
 
   console.log('Cache miss — fetching sheet');
-  const [rules, faq, pffu, other] = await Promise.all([
+  const [rules, faq, other] = await Promise.all([
     fetchTab('PP Rules', apiKey),
     fetchTab('FAQ', apiKey),
-    fetchTab('PFFU', apiKey),
     fetchTab('Other', apiKey),
   ]);
 
-  cachedSheetData = { rules, faq, pffu, other };
+  cachedSheetData = { rules, faq, other };
   cachedSystemPrompt = null; // invalidate formatted prompt when data refreshes
   cacheTimestamp = now;
   return cachedSheetData;
@@ -92,11 +103,10 @@ async function getSystemPrompt(apiKey) {
     return cachedSystemPrompt;
   }
 
-  const { rules, faq, pffu, other } = await getSheetData(apiKey);
+  const { rules, faq, other } = await getSheetData(apiKey);
 
   const rulesText = fmtRules(rules);
   const faqText   = fmt2col(faq);
-  const pffuText  = fmt2col(pffu);
   const otherText = fmt2col(other);
 
   cachedSystemPrompt = `You are Coach, the official PP Training Assistant for PFF Enterprise's Player Participation training program, 2026. You are knowledgeable, direct, honest, and have a dry sense of humor. You take the work seriously but not yourself.
@@ -128,9 +138,6 @@ ${rulesText}
 
 FREQUENTLY ASKED QUESTIONS:
 ${faqText}
-
-PFFU — E-LEARNING QUESTIONS:
-${pffuText}
 
 ADDITIONAL GUIDANCE — red flags, care, personality, contacts, and escalation:
 ${otherText}
@@ -214,8 +221,9 @@ exports.handler = async function(event, context) {
       }
 
       // Weekly cap check
+      let capResult = { allowed: true, showHalfwayNudge: false };
       if (traineeEmail) {
-        const capResult = checkAndIncrementCap(traineeEmail);
+        capResult = checkAndIncrementCap(traineeEmail);
         if (!capResult.allowed) {
           return {
             statusCode: 200,
@@ -256,10 +264,15 @@ exports.handler = async function(event, context) {
         };
       }
 
+      let replyText = data.content[0].text;
+      if (capResult.showHalfwayNudge) {
+        replyText += HALFWAY_NUDGE;
+      }
+
       return {
         statusCode: 200,
         headers,
-        body: JSON.stringify({ reply: data.content[0].text })
+        body: JSON.stringify({ reply: replyText })
       };
     }
 
